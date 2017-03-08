@@ -1,0 +1,9 @@
+[package]
+name = "client"
+version = "0.1.0"
+authors = ["Sam Sartor <me@samsartor.com>"]
+
+[dependencies]
+common = {lib = "../common"}
+glium = "~0.16"
+nalgebra = "~0.11"

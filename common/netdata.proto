@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+enum Rotation {
+	NORTH = 0;
+	EAST = 1;
+	SOUTH = 2;
+	WEST = 3;
+}
+
+message SSpawnEntity {
+	uint64 id = 1;
+	string type = 2;
+	float x = 3;
+	float y = 4;
+	float angle = 5;
+}
+
+message SMoveEntity {
+	uint64 id = 1;
+	float x = 2;
+	float y = 3;
+	float angle = 5;
+}
+
+message SSplash {
+	string type = 1;
+	uint64 parent = 10;
+	float x = 2;
+	float y = 3;
+	float dx = 4;
+	float dy = 5;
+	bytes extra = 11;
+}
+
+message FromServer {
+	oneof pak {
+		SSpawnEntity spawn_entity = 5;
+		SMoveEntity move_entity = 6;
+		SSplash splash = 11;
+	}
+}
+
+message CPlaceStructure {
+	string id = 1;
+	int32 x = 2; 
+	int32 y = 3;
+	Rotation rot = 4;
+	bytes extra = 10;
+}
+
+message FromClient {
+	oneof pak {
+		CPlaceStructure place = 10;
+	}
+}
