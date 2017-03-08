@@ -7,6 +7,11 @@ enum Rotation {
 	WEST = 3;
 }
 
+message SChat {
+	string from = 1;
+	string msg = 2;
+}
+
 message SSpawnEntity {
 	uint64 id = 1;
 	string type = 2;
@@ -36,8 +41,14 @@ message FromServer {
 	oneof pak {
 		SSpawnEntity spawn_entity = 5;
 		SMoveEntity move_entity = 6;
-		SSplash splash = 11;
+		SSplash splash = 10;
+		SChat chat = 20;
 	}
+}
+
+message CChat {
+	string msg = 1;
+	repeated string to = 2;
 }
 
 message CPlaceStructure {
@@ -51,5 +62,6 @@ message CPlaceStructure {
 message FromClient {
 	oneof pak {
 		CPlaceStructure place = 10;
+		CChat chat = 20;
 	}
 }

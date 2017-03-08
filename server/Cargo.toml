@@ -1,7 +1,11 @@
 [package]
 name = "server"
 version = "0.1.0"
-authors = ["Sam Sartor <me@samsartor.com>"]
+authors = [ 
+    "Sumner Evans <sumner.evans98@gmail.com>", 
+    "Sam Sartor <me@samsartor.com>", 
+    "Robbie Merillat <rdmerillat@mines.edu>" 
+]
 
 [dependencies]
-common = {lib = "../common"}
+common = {path = "../common"}

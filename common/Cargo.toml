@@ -1,8 +1,16 @@
 [package]
 name = "common"
 version = "0.1.0"
-authors = ["Sam Sartor <me@samsartor.com>"]
+authors = [ 
+    "Sumner Evans <sumner.evans98@gmail.com>", 
+    "Sam Sartor <me@samsartor.com>", 
+    "Robbie Merillat <rdmerillat@mines.edu>" 
+]
+build = "build.rs"
 
 [dependencies]
 protobuf = "~1.2"
 crossbeam = "~0.2"
+tokio-core = "0.1.4"
+byteorder = "~1.0"
+futures = "*"

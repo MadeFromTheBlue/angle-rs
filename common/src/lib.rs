@@ -1,9 +1,10 @@
+#![feature(box_syntax, box_patterns)]
+
 extern crate protobuf;
 extern crate crossbeam;
+extern crate tokio_core;
+extern crate byteorder;
+extern crate futures;
 
-mod net;
-mod netdata;
-
-#[test]
-fn it_works() {
-}
+pub mod net;
+pub mod netdata;
