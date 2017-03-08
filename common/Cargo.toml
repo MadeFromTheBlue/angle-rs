@@ -5,3 +5,4 @@ authors = ["Sam Sartor <me@samsartor.com>"]
 
 [dependencies]
 protobuf = "~1.2"
+crossbeam = "~0.2"
