@@ -1,14 +1,17 @@
 use protobuf::*;
 
+use crossbeam::sync::{ArcCell, SegQueue};
+
 use std::io;
-use std::net::{ToSocketAddrs};
+use std::net::{SocketAddr};
 use std::marker::PhantomData;
+use std::sync::{Arc};
 
-use tokio_core::io::{Framed, Io, EasyBuf, Codec};
-use tokio_core::net::{TcpStream};
+use futures::{future, Sink, Future, Stream};
+use futures::sync::mpsc;
+use tokio_core::net::TcpStream;
+use tokio_core::io::{Io, Codec, EasyBuf};
 use tokio_core::reactor::Handle;
-
-use futures::{Future};
 
 use byteorder::{ByteOrder, NetworkEndian};
 
@@ -51,33 +54,100 @@ impl<I: MessageStatic, O: Message> Codec for NetCodec<I, O> {
     }
 }
 
-pub struct Connection<S: Io, I, O> {
-    stream: Framed<S, NetCodec<I, O>>,
+pub enum ConnectionState {
+    Starting,
+    NotConnected(io::Error),
+    Running,
+    Error(io::Error),
+    Shutdown,
 }
 
-impl<I: MessageStatic, O: Message> Connection<TcpStream, I, O> {
-    pub fn connect<A: ToSocketAddrs>(addr: A, handle: &Handle) -> Result<Connection<TcpStream, I, O>, io::Error> {
-        let addr = addr.to_socket_addrs()?.next().unwrap();
-        Ok(Self::from_stream(TcpStream::connect(&addr, handle).wait()?))
+impl ConnectionState {
+    pub fn is_running(&self) -> bool {
+        use self::ConnectionState::*;
+        match *self {
+            Running => true,
+            _ => false,
+        }
     }
 }
 
-impl<S: Io, I: MessageStatic, O: Message> Connection<S, I, O> {
-    pub fn from_stream(stream: S) -> Connection<S, I, O> {
-        Connection {
-            stream: stream.framed(NetCodec::new())
+pub struct Connection<I, O> {
+    out_queue: mpsc::UnboundedSender<O>,
+    in_queue: Arc<SegQueue<I>>,
+    state: Arc<ArcCell<ConnectionState>>,
+}
+
+impl<I: MessageStatic, O: Message> Connection<I, O> {
+    pub fn send(&self, msg: O) {
+        match (&self.out_queue).send(msg) {
+            Ok(_) => (),
+            Err(_) => (),
         }
     }
 
-    pub fn get_stream(&self) -> &Framed<S, NetCodec<I, O>> {
-        &self.stream
+    pub fn receive(&self) -> Option<I> {
+        self.in_queue.try_pop()
     }
 
-    pub fn get_mut_stream(&mut self) -> &mut Framed<S, NetCodec<I, O>> {
-        &mut self.stream
+    pub fn is_running(&self) -> bool {
+        self.state.get().is_running()
     }
 
-    pub fn as_stream(self) -> Box<Framed<S, NetCodec<I, O>>> {
-        box self.stream
+    pub fn get_state(&self) -> Arc<ConnectionState> {
+        self.state.get()
+    }
+
+    pub fn run(addr: &SocketAddr, run: &Handle) -> Connection<I, O> {
+        use self::ConnectionState::*;
+
+        let iqr = Arc::new(SegQueue::new());
+        let iqs = iqr.clone();
+        let (oqs, oqr) = mpsc::unbounded();
+
+        let state = Arc::new(ArcCell::new(Arc::new(Starting)));
+        let cstate = state.clone();
+        let jstate = state.clone();
+        let estate = state.clone();
+
+        let remote = run.remote();
+
+        let stream = TcpStream::connect(addr, run)
+            .and_then(move |stream| {
+                let (to, from) = stream.framed(NetCodec::<I, O>::new()).split();
+
+                let sender = to
+                    .send_all(oqr.map_err(|_| io::ErrorKind::Other));
+
+                let receiver = from
+                    .for_each(move |v| {
+                        iqs.push(v);
+                        future::ok::<(), io::Error>(())
+                    });
+
+                let joined = sender.join(receiver)
+                    .and_then(|_| {
+                        jstate.set(Arc::new(Shutdown));
+                        future::ok(())
+                    }).or_else(|e| {
+                        estate.set(Arc::new(Error(e)));
+                        future::err(())
+                    });
+
+                // TODO join
+
+                future::ok(())
+            }).or_else(move |e| {
+                cstate.set(Arc::new(NotConnected(e)));
+                future::err(())
+            });
+
+        run.spawn(stream);
+
+        Connection {
+            out_queue: oqs,
+            in_queue: iqr,
+            state: state,
+        }
     }
 }
