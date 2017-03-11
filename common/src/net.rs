@@ -1,6 +1,6 @@
 use protobuf::*;
 
-use crossbeam::sync::{ArcCell, SegQueue};
+use crossbeam::sync::{ArcCell, MsQueue};
 
 use std::io;
 use std::net::{SocketAddr};
@@ -54,6 +54,7 @@ impl<I: MessageStatic, O: Message> Codec for NetCodec<I, O> {
     }
 }
 
+#[derive(Debug)]
 pub enum ConnectionState {
     Starting,
     NotConnected(io::Error),
@@ -74,7 +75,7 @@ impl ConnectionState {
 
 pub struct Connection<I, O> {
     out_queue: mpsc::UnboundedSender<O>,
-    in_queue: Arc<SegQueue<I>>,
+    in_queue: Arc<MsQueue<I>>,
     state: Arc<ArcCell<ConnectionState>>,
 }
 
@@ -90,6 +91,10 @@ impl<I: MessageStatic, O: Message> Connection<I, O> {
         self.in_queue.try_pop()
     }
 
+    pub fn receive_some(&self) -> I {
+        self.in_queue.pop()
+    }
+
     pub fn is_running(&self) -> bool {
         self.state.get().is_running()
     }
@@ -98,48 +103,67 @@ impl<I: MessageStatic, O: Message> Connection<I, O> {
         self.state.get()
     }
 
-    pub fn run(addr: &SocketAddr, run: &Handle) -> Connection<I, O> {
+    fn process_stream(stream: TcpStream, iqs: Arc<MsQueue<I>>, oqr: mpsc::UnboundedReceiver<O>, state: Arc<ArcCell<ConnectionState>>) -> Box<Future<Error = (), Item = ()>> {
         use self::ConnectionState::*;
 
-        let iqr = Arc::new(SegQueue::new());
+        let (to, from) = stream.framed(NetCodec::<I, O>::new()).split();
+
+        let sender = to
+            .send_all(oqr.map_err(|_| io::ErrorKind::Other));
+
+        let receiver = from
+            .for_each(move |v| {
+                iqs.push(v);
+                future::ok::<(), io::Error>(())
+            });
+
+        let statecopy = state.clone();
+
+        sender.join(receiver)
+            .and_then(move |_| {
+                state.set(Arc::new(Shutdown));
+                future::ok(())
+            }).or_else(move |e| {
+                statecopy.set(Arc::new(Error(e)));
+                future::err(())
+            }).boxed()
+    }
+
+    pub fn run_on(stream: TcpStream, run: &Handle) -> Connection<I, O> {
+        use self::ConnectionState::*;
+
+        let iqr = Arc::new(MsQueue::new());
         let iqs = iqr.clone();
         let (oqs, oqr) = mpsc::unbounded();
 
         let state = Arc::new(ArcCell::new(Arc::new(Starting)));
-        let cstate = state.clone();
-        let jstate = state.clone();
-        let estate = state.clone();
 
-        let remote = run.remote();
+        run.spawn(Connection::process_stream(stream, iqs, oqr, state.clone()));
+
+        Connection {
+            out_queue: oqs,
+            in_queue: iqr,
+            state: state,
+        }
+    }
+
+    pub fn run(addr: &SocketAddr, run: &Handle) -> Connection<I, O> {
+        use self::ConnectionState::*;
+
+        let iqr = Arc::new(MsQueue::new());
+        let iqs = iqr.clone();
+        let (oqs, oqr) = mpsc::unbounded();
+
+        let state = Arc::new(ArcCell::new(Arc::new(Starting)));
+        let state1 = state.clone();
+        let state2 = state.clone();
 
         let stream = TcpStream::connect(addr, run)
-            .and_then(move |stream| {
-                let (to, from) = stream.framed(NetCodec::<I, O>::new()).split();
-
-                let sender = to
-                    .send_all(oqr.map_err(|_| io::ErrorKind::Other));
-
-                let receiver = from
-                    .for_each(move |v| {
-                        iqs.push(v);
-                        future::ok::<(), io::Error>(())
-                    });
-
-                let joined = sender.join(receiver)
-                    .and_then(|_| {
-                        jstate.set(Arc::new(Shutdown));
-                        future::ok(())
-                    }).or_else(|e| {
-                        estate.set(Arc::new(Error(e)));
-                        future::err(())
-                    });
-
-                // TODO join
-
-                future::ok(())
-            }).or_else(move |e| {
-                cstate.set(Arc::new(NotConnected(e)));
+            .or_else(move |e| {
+                state1.set(Arc::new(NotConnected(e)));
                 future::err(())
+            }).and_then(move |stream| {
+                Connection::process_stream(stream, iqs, oqr, state2)
             });
 
         run.spawn(stream);
