@@ -2,62 +2,17 @@ use protobuf::*;
 
 use crossbeam::sync::{ArcCell, MsQueue};
 
-use std::io;
-use std::net::{SocketAddr};
-use std::marker::PhantomData;
+use std::io::{self, Read, Write};
+use std::net::{TcpStream, Shutdown};
 use std::sync::{Arc};
-
-use futures::{future, Sink, Future, Stream};
-use futures::sync::mpsc;
-use tokio_core::net::TcpStream;
-use tokio_core::io::{Io, Codec, EasyBuf};
-use tokio_core::reactor::Handle;
+use std::thread::{spawn, JoinHandle};
 
 use byteorder::{ByteOrder, NetworkEndian};
 
-pub struct NetCodec<I, O> {
-    i_type: PhantomData<I>,
-    o_type: PhantomData<O>,
-}
-
-impl<I: MessageStatic, O: Message> NetCodec<I, O> {
-    pub fn new() -> NetCodec<I, O> {
-        NetCodec {
-            i_type: PhantomData,
-            o_type: PhantomData,
-        }
-    }
-}
-
-impl<I: MessageStatic, O: Message> Codec for NetCodec<I, O> {
-    type In = I;
-    type Out = O;
-
-    fn decode(&mut self, buf: &mut EasyBuf) -> io::Result<Option<I>> {
-        let avalible = buf.len();
-
-        if avalible < 4 { return Ok(None) }
-        else {
-            let len = NetworkEndian::read_u32(&buf.as_ref()[..4]) as usize;
-            if avalible - 4 >= len {
-                Ok(Some(parse_from_bytes(&buf.drain_to(len + 4).as_ref()[4..])?))
-            }
-            else { Ok(None) }
-        }
-    }
-
-    fn encode(&mut self, msg: O, buf: &mut Vec<u8>) -> io::Result<()> {
-        buf.extend(&[0u8; 4]);
-        msg.write_to_vec(buf)?;
-        NetworkEndian::write_u32(&mut buf[0..4], msg.get_cached_size());
-        Ok(())
-    }
-}
+use protobuf::parse_from_bytes;
 
 #[derive(Debug)]
 pub enum ConnectionState {
-    Starting,
-    NotConnected(io::Error),
     Running,
     Error(io::Error),
     Shutdown,
@@ -74,17 +29,40 @@ impl ConnectionState {
 }
 
 pub struct Connection<I, O> {
-    out_queue: mpsc::UnboundedSender<O>,
+    stream: TcpStream,
+    out_queue: Arc<MsQueue<O>>,
+    out_thread: JoinHandle<()>,
     in_queue: Arc<MsQueue<I>>,
+    in_thread: JoinHandle<()>,
     state: Arc<ArcCell<ConnectionState>>,
+}
+
+fn read_packet<I: MessageStatic>(stream: &mut TcpStream) -> Result<I, io::Error> {
+    let mut size_bytes = [0u8; 4];
+    stream.read_exact(&mut size_bytes)?;
+    let size = NetworkEndian::read_u32(&size_bytes);
+
+    let mut data: Vec<u8> = (0..size).map(|_| 0u8).collect();
+    stream.read_exact(&mut data)?;
+
+    Ok(parse_from_bytes(&mut data[..])?)
+}
+
+fn write_packet<O: Message>(stream: &mut TcpStream, pak: O) -> Result<(), io::Error> {
+    let data = pak.write_to_bytes()?;
+
+    let mut size_bytes = [0u8; 4];
+    NetworkEndian::write_u32(&mut size_bytes, pak.get_cached_size());
+
+    stream.write_all(&size_bytes)?;
+    stream.write_all(&data[..])?;
+
+    Ok(())
 }
 
 impl<I: MessageStatic, O: Message> Connection<I, O> {
     pub fn send(&self, msg: O) {
-        match (&self.out_queue).send(msg) {
-            Ok(_) => (),
-            Err(_) => (),
-        }
+        self.out_queue.push(msg);
     }
 
     pub fn receive(&self) -> Option<I> {
@@ -103,75 +81,62 @@ impl<I: MessageStatic, O: Message> Connection<I, O> {
         self.state.get()
     }
 
-    fn process_stream(stream: TcpStream, iqs: Arc<MsQueue<I>>, oqr: mpsc::UnboundedReceiver<O>, state: Arc<ArcCell<ConnectionState>>) -> Box<Future<Error = (), Item = ()>> {
-        use self::ConnectionState::*;
-
-        let (to, from) = stream.framed(NetCodec::<I, O>::new()).split();
-
-        let sender = to
-            .send_all(oqr.map_err(|_| io::ErrorKind::Other));
-
-        let receiver = from
-            .for_each(move |v| {
-                iqs.push(v);
-                future::ok::<(), io::Error>(())
-            });
-
-        let statecopy = state.clone();
-
-        sender.join(receiver)
-            .and_then(move |_| {
-                state.set(Arc::new(Shutdown));
-                future::ok(())
-            }).or_else(move |e| {
-                statecopy.set(Arc::new(Error(e)));
-                future::err(())
-            }).boxed()
+    pub fn close(self) {
+        self.stream.shutdown(Shutdown::Both).unwrap();
+        self.out_thread.join().unwrap();
+        self.in_thread.join().unwrap();
     }
 
-    pub fn run_on(stream: TcpStream, run: &Handle) -> Connection<I, O> {
+    pub fn run_on(stream: TcpStream) -> Result<Connection<I, O>, io::Error> {
         use self::ConnectionState::*;
 
-        let iqr = Arc::new(MsQueue::new());
-        let iqs = iqr.clone();
-        let (oqs, oqr) = mpsc::unbounded();
+        stream.set_nodelay(true).unwrap();
 
-        let state = Arc::new(ArcCell::new(Arc::new(Starting)));
+        let iq = Arc::new(MsQueue::new());
+        let oq: Arc<MsQueue<O>> = Arc::new(MsQueue::new());
 
-        run.spawn(Connection::process_stream(stream, iqs, oqr, state.clone()));
+        let state = Arc::new(ArcCell::new(Arc::new(Running)));
 
-        Connection {
-            out_queue: oqs,
-            in_queue: iqr,
+        let iqc = iq.clone();
+        let is = stream.try_clone()?;
+        let istate = state.clone();
+        let it = spawn(move || {
+            let mut is = is;
+            while istate.get().is_running() {
+                iqc.push(match read_packet(&mut is) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        istate.set(Arc::new(Error(io::Error::from(e))));
+                        return;
+                    }
+                });
+            }
+        });
+
+        let oqc = oq.clone();
+        let os = stream.try_clone()?;
+        let ostate = state.clone();
+        let ot = spawn(move || {
+            let mut os = os;
+            while ostate.get().is_running() {
+                match write_packet(&mut os, oqc.pop()) {
+                    Err(e) => {
+                        ostate.set(Arc::new(Error(io::Error::from(e))));
+                        return;
+                    },
+                    _ => (),
+                }
+                os.flush().unwrap();
+            }
+        });
+
+        Ok(Connection {
+            stream: stream,
+            out_queue: oq,
+            out_thread: ot,
+            in_queue: iq,
+            in_thread: it,
             state: state,
-        }
-    }
-
-    pub fn run(addr: &SocketAddr, run: &Handle) -> Connection<I, O> {
-        use self::ConnectionState::*;
-
-        let iqr = Arc::new(MsQueue::new());
-        let iqs = iqr.clone();
-        let (oqs, oqr) = mpsc::unbounded();
-
-        let state = Arc::new(ArcCell::new(Arc::new(Starting)));
-        let state1 = state.clone();
-        let state2 = state.clone();
-
-        let stream = TcpStream::connect(addr, run)
-            .or_else(move |e| {
-                state1.set(Arc::new(NotConnected(e)));
-                future::err(())
-            }).and_then(move |stream| {
-                Connection::process_stream(stream, iqs, oqr, state2)
-            });
-
-        run.spawn(stream);
-
-        Connection {
-            out_queue: oqs,
-            in_queue: iqr,
-            state: state,
-        }
+        })
     }
 }
